@@ -1,15 +1,15 @@
-import records
-import config
-
-import discord
-from discord.ext import commands
-from discord import app_commands
 import asyncio
 import random
 import smtplib
 from email.mime.text import MIMEText
-
 from typing import cast
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import config
+import records
 
 #Init Bot Settings
 intents = discord.Intents.default()
@@ -123,7 +123,11 @@ async def handle_team_deletion(team_id: int): # TESTED
 
         # Remove Role and team_id from each user on team
         for member in records.get_team_members(team_id):
-            await perform_team_leave(guild.get_member(member['discord_id']), team_id)
+            guild_member = guild.get_member(member['discord_id']) if guild else None
+            if guild_member:
+                await perform_team_leave(guild_member, team_id)
+            else:
+                records.leave_team(member['discord_id'])
             
         # Remove all Channels
         await delete_team_channels(team_id)
@@ -433,6 +437,12 @@ async def create_team(interaction: discord.Interaction, team_name: str, teammate
     for mem in members:
         if not mem:
             continue
+        if mem.id == user.id:
+            await interaction.followup.send(
+                ephemeral=True,
+                content="Failed to add team member. You cannot add yourself as a teammate."
+            )
+            continue
         match can_join_team(mem, is_capstone):
             case -1 | -2:
                 await interaction.followup.send(
@@ -620,11 +630,10 @@ async def add_member(interaction: discord.Interaction, member: discord.Member): 
         return
 
     # Check if user can join the team
-    is_capstone = records.get_team(team_id)
-    match can_join_team(added_user):
+    match can_join_team(added_user, is_capstone):
         case -1 | -2 : await interaction.followup.send(content=f"Failed to add team member. {added_user.mention} is not a verified participant."); return
         case      -3 : await interaction.followup.send(content=f"Failed to add team member. {added_user.mention} is already on a team. To join, they must leave using /leave_team"); return
-        case      -4 : await interaction.followup.send(content=f"Failed to add team member. {added_user.mention} is {"NOT " if is_capstone else ""}registered as a capstone participant while you are {"" if is_capstone else "NOT "}registered as capstone. If this is a mistake, members can re-regsiter at {config.contact_registration_link}")
+        case      -4 : await interaction.followup.send(content=f"Failed to add team member. {added_user.mention} is {"NOT " if is_capstone else ""}registered as a capstone participant while you are {"" if is_capstone else "NOT "}registered as capstone. If this is a mistake, members can re-regsiter at {config.contact_registration_link}"); return
 
     # ------------- Happy Case --------------------
 
@@ -839,18 +848,34 @@ async def delete_team(interaction: discord.Interaction, team_role: discord.Role,
     await interaction.response.defer(ephemeral=True)
 
     # Retrieve team details before removal
-    team_name = team_role.name
-    team_id = records.get_team(team_name)['id']
-    members = records.get_team_members(team_name)
+    team_data = next((team for team in records.get_all_teams() if team["role_id"] == team_role.id), None)
+    if not team_data:
+        await interaction.followup.send(content=f"`{team_role.name}` is not associated with an active team.")
+        return
+
+    team_name = team_data["name"]
+    team_id = team_data["id"]
+    members = records.get_team_members(team_id)
 
     # ------------- Happy Case --------------------
 
     # Notify team and admin about removal
+    notified_count = 0
     for member in members:
-        await interaction.guild.get_member(member['discord_id']).send(
-            content=f"Your team has been removed from the event. \nReason: `{reason_for_removal}`. \nYou may create a new team but continued failure to comply may result in being permanently removed")
+        member_obj = interaction.guild.get_member(member['discord_id'])
+        if not member_obj:
+            continue
+        try:
+            await member_obj.send(
+                content=f"Your team has been removed from the event. \nReason: `{reason_for_removal}`. \nYou may create a new team but continued failure to comply may result in being permanently removed"
+            )
+            notified_count += 1
+        except (discord.Forbidden, discord.HTTPException):
+            continue
     
-    await interaction.followup.send(content=f"The team `<{team_name}>` has been removed and the members have been notified")
+    await interaction.followup.send(
+        content=f"The team `<{team_name}>` has been removed. Notified {notified_count}/{len(members)} members via DM."
+    )
 
     # Remove channels and remove team stats from members
     await handle_team_deletion(team_id)    
